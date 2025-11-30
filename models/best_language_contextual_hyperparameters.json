@@ -1,0 +1,10 @@
+{
+    "fusion": "gated",
+    "hidden_size": 128,
+    "lr": 0.001,
+    "dropout": 0.3,
+    "batch_size": 16,
+    "num_layers": 2,
+    "agg_r": 0.3445260226726532,
+    "agg_re": 0.18848025798797607
+}
