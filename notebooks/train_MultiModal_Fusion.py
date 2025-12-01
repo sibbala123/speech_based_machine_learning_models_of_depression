@@ -32,7 +32,7 @@ ACOUSTIC_PKL = os.path.join(DATA_DIR, "acoustic_features.pkl")
 LANGUAGE_MODEL = os.path.join(MODEL_DIR, "contextual_lstm_best_overall.pt")
 ACOUSTIC_MODEL = os.path.join(MODEL_DIR, "lstm_acoustic_best_overall.pt")
 LANGUAGE_HPARAMS = os.path.join(MODEL_DIR, "best_language_contextual_hyperparameters.json")
-ACOUSTIC_SCALER = os.path.join(MODEL_DIR, "best_scaler.pkl")
+ACOUSTIC_SCALER = os.path.join(MODEL_DIR, "best_acoustic_scaler.pkl")
 
 # Output
 FUSION_MODEL_DIR = os.path.join(MODEL_DIR, "multimodal")
@@ -66,49 +66,68 @@ np.random.seed(RANDOM_STATE)
 # ====================================================================
 
 class ContextualLSTM(nn.Module):
-    """Language LSTM from training script."""
-    def __init__(self, bert_dim=384, hidden_size=128, num_layers=2, dropout=0.3, fusion="concat"):
+    """Exact architecture to match saved model (bidirectional, hidden_size=256)."""
+    def __init__(self, bert_dim=384, hidden_size=256, num_layers=2, dropout=0.3, fusion="concat"):
         super().__init__()
         self.fusion = fusion
         self.hidden_size = hidden_size
+        self.bidirectional = True  # Match saved model
+        lstm_input = bert_dim + 1 if fusion == "concat" else bert_dim
         
-        input_size = bert_dim + 1 if fusion == "concat" else bert_dim
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
-                           batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        self.lstm = nn.LSTM(
+            lstm_input,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=self.bidirectional
+        )
+        
+        self.layer_norm = nn.LayerNorm(hidden_size * 2)  # because bidirectional
         
         if fusion in ("gated", "attention"):
             self.sent_agg_encoder = nn.Sequential(
-                nn.Linear(2, 32), nn.ReLU(), nn.Dropout(dropout), nn.Linear(32, hidden_size))
+                nn.Linear(2, 32),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, hidden_size * 2)
+            )
         if fusion == "gated":
-            self.gate_layer = nn.Linear(hidden_size, hidden_size)
+            self.gate_layer = nn.Linear(hidden_size * 2, hidden_size * 2)
         if fusion == "attention":
-            self.att_text = nn.Linear(hidden_size, hidden_size)
-            self.att_sent = nn.Linear(hidden_size, hidden_size)
-            self.att_comb = nn.Linear(hidden_size, 1)
+            self.att_text = nn.Linear(hidden_size * 2, hidden_size * 2)
+            self.att_sent = nn.Linear(hidden_size * 2, hidden_size * 2)
+            self.att_comb = nn.Linear(hidden_size * 2, 1)
         
-        self.fc1 = nn.Linear(hidden_size, 64)
+        self.fc1 = nn.Linear(hidden_size * 2, 64)
         self.fc2 = nn.Linear(64, 1)
 
     def get_embedding(self, bert_seq, sent_seq, mask, lengths, sent_agg):
-        """Extract embedding before final classification layers."""
         B, T, D = bert_seq.shape
         x = torch.cat([bert_seq, sent_seq], dim=2) if self.fusion == "concat" else bert_seq
         
         packed = nn.utils.rnn.pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         packed_out, (h_n, _) = self.lstm(packed)
         
+        # Concatenate final states from both directions
+        if self.bidirectional:
+            h_last = torch.cat([h_n[-2], h_n[-1]], dim=1)
+        else:
+            h_last = h_n[-1]
+        h_last = self.layer_norm(h_last)
+        
         if self.fusion == "concat":
-            return h_n[-1]  # Last layer hidden state
+            return h_last
         else:
             lstm_out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True, total_length=T)
-            # Use the hidden state corresponding to the last element of the sequence
-            idx = (lengths - 1).long().unsqueeze(1).unsqueeze(2).expand(B, 1, self.hidden_size)
-            h_last = lstm_out.gather(1, idx).squeeze(1)
+            idx = (lengths - 1).long().unsqueeze(1).unsqueeze(2).expand(B, 1, self.hidden_size * 2)
+            h_last_seq = lstm_out.gather(1, idx).squeeze(1)
+            h_last_seq = self.layer_norm(h_last_seq)
             
             if self.fusion == "gated":
                 sent_vec = self.sent_agg_encoder(sent_agg)
                 gate = torch.sigmoid(self.gate_layer(sent_vec))
-                return h_last * gate
+                return h_last_seq * gate
             else:  # attention
                 sent_vec = self.sent_agg_encoder(sent_agg).unsqueeze(1)
                 att_in = torch.tanh(self.att_text(lstm_out) + self.att_sent(sent_vec))
@@ -118,12 +137,23 @@ class ContextualLSTM(nn.Module):
 
 
 class AcousticLSTM(nn.Module):
-    """Acoustic LSTM from training script."""
-    def __init__(self, input_dim, hidden_size=128, num_layers=1, dropout=0.3):
+    """Acoustic LSTM exactly matching the saved checkpoint."""
+    def __init__(self, input_dim, hidden_size=256, num_layers=1, dropout=0.3, bidirectional=False):
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_size, num_layers, batch_first=True,
-                           dropout=dropout if num_layers > 1 else 0)
-        self.fc1 = nn.Linear(hidden_size, 64)
+        self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
+        
+        self.lstm = nn.LSTM(
+            input_dim,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional
+        )
+        
+        # Adjust fc1 input according to uni- or bidirectional LSTM
+        self.fc1 = nn.Linear(hidden_size * (2 if bidirectional else 1), 64)
         self.fc_out = nn.Linear(64, 1)
 
     def get_embedding(self, x, lengths, mask):
@@ -133,30 +163,25 @@ class AcousticLSTM(nn.Module):
         out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
         
         out = out * mask.unsqueeze(-1)
-        # Get the final hidden state before padding starts
+        # Get the last valid hidden state per sequence
         last_idx = (lengths - 1).view(-1, 1, 1).expand(out.size(0), 1, out.size(2))
         return out.gather(1, last_idx).squeeze(1)
-
 
 # ====================================================================
 # FUSION MODEL
 # ====================================================================
 
 class MultimodalFusion(nn.Module):
-    """
-    Combines language and acoustic embeddings.
-    Both branches are fine-tuned during training.
-    """
     def __init__(self, lang_model, acoustic_model, fusion_hidden=128, dropout=0.3):
         super().__init__()
         self.lang_model = lang_model
         self.acoustic_model = acoustic_model
         
-        # Get embedding dimensions
-        lang_dim = lang_model.hidden_size
-        acoustic_dim = acoustic_model.lstm.hidden_size
+        # Language model embedding dimension (always hidden_size * 2 for ContextualLSTM in this script)
+        lang_dim = lang_model.hidden_size * 2
+        # Acoustic model embedding dimension (hidden_size * 2 if bidirectional, else * 1)
+        acoustic_dim = acoustic_model.lstm.hidden_size * (2 if getattr(acoustic_model.lstm, 'bidirectional', False) else 1)
         
-        # Fusion network
         self.fusion = nn.Sequential(
             nn.Linear(lang_dim + acoustic_dim, fusion_hidden),
             nn.ReLU(),
@@ -166,22 +191,17 @@ class MultimodalFusion(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(64, 1)
         )
-    
+
     def forward(self, lang_inputs, acoustic_inputs):
-        """
-        lang_inputs: (bert_seq, sent_seq, mask, lengths, sent_agg)
-        acoustic_inputs: (acoustic_seq, lengths, mask)
-        """
         bert_seq, sent_seq, lang_mask, lang_lengths, sent_agg = lang_inputs
         acoustic_seq, acoustic_lengths, acoustic_mask = acoustic_inputs
         
-        # Extract embeddings from both models
-        lang_embed = self.lang_model.get_embedding(bert_seq, sent_seq, lang_mask, 
-                                                     lang_lengths, sent_agg)
-        acoustic_embed = self.acoustic_model.get_embedding(acoustic_seq, acoustic_lengths, 
-                                                             acoustic_mask)
+        # Pre-trained models are frozen, only their embeddings are used.
+        # Ensure they are in evaluation mode during CV/Training of fusion layer.
+        # This is handled by setting requires_grad=False on their parameters.
+        lang_embed = self.lang_model.get_embedding(bert_seq, sent_seq, lang_mask, lang_lengths, sent_agg)
+        acoustic_embed = self.acoustic_model.get_embedding(acoustic_seq, acoustic_lengths, acoustic_mask)
         
-        # Concatenate and pass through fusion layers
         combined = torch.cat([lang_embed, acoustic_embed], dim=1)
         return self.fusion(combined).squeeze(1)
 
@@ -203,8 +223,8 @@ def load_and_align_data():
     # --- Alignment Logic ---
     # Find participant IDs from the keys of the feature dictionaries
     if isinstance(lang_data["bert_sequences"], dict):
+        # Assuming all feature dicts (bert, sentiment) use the same PIDs as keys
         lang_pids_raw = list(lang_data["bert_sequences"].keys())
-        # Assuming lang_data["phq_scores"] is indexed by lang_data["participant_ids"]
         # We need a map from PID to score for lookup
         phq_pid_to_score = {str(pid).strip(): score for pid, score in zip(lang_data["participant_ids"], lang_data["phq_scores"])}
     else:
@@ -231,10 +251,10 @@ def load_and_align_data():
 
     # Align and combine data
     # Convert common_pids (which are strings) to integers for language data lookup
-    # We assume the acoustic data keys are strings, so we keep the strings for acoustic lookup.
     common_pids_int = [int(pid) for pid in common_pids]
 
     # Use the integer PIDs for lookup in lang_data["bert_sequences"] (which has int keys)
+    # The language features are expected to be keyed by int PIDs.
     lang_bert = [lang_data["bert_sequences"][pid] for pid in common_pids_int]
     lang_sent = [lang_data["sentiment_sequences"][pid] for pid in common_pids_int]
     lang_lengths = [len(lang_bert[i]) for i in range(len(common_pids))]
@@ -282,7 +302,8 @@ def collate_fn(batch):
     lang_len = np.array(lang_len, dtype=np.int64)
     max_lang = int(lang_len.max())
     B = len(batch)
-    bert_dim = lang_bert[0].shape[1]
+    # Check if lang_bert[0] is a numpy array; if so, get shape.
+    bert_dim = lang_bert[0].shape[1] if isinstance(lang_bert[0], np.ndarray) else lang_bert[0].shape[0] 
     
     bert_pad = np.zeros((B, max_lang, bert_dim), dtype=np.float32)
     sent_pad = np.zeros((B, max_lang), dtype=np.float32)
@@ -382,6 +403,7 @@ def evaluate_with_pids(model, loader, device):
 # ====================================================================
 
 if __name__ == "__main__":
+    start_time = time.time()
     print("="*60)
     print("MULTIMODAL FUSION TRAINING")
     print("="*60)
@@ -398,6 +420,7 @@ if __name__ == "__main__":
     def subset_data(data_list, indices):
         return [data_list[i] for i in indices]
 
+    # Subset the training data for CV
     train_pids = subset_data(pids, train_idx)
     train_lang_bert = subset_data(lang_bert, train_idx)
     train_lang_sent = subset_data(lang_sent, train_idx)
@@ -406,6 +429,7 @@ if __name__ == "__main__":
     train_acoustic_lengths = subset_data(acoustic_lengths, train_idx)
     train_phq_scores = phq_scores[train_idx]
     
+    # Subset the test data (holdout set)
     test_pids = subset_data(pids, test_idx)
     test_lang_bert = subset_data(lang_bert, test_idx)
     test_lang_sent = subset_data(lang_sent, test_idx)
@@ -414,68 +438,67 @@ if __name__ == "__main__":
     test_acoustic_lengths = subset_data(acoustic_lengths, test_idx)
     test_phq_scores = phq_scores[test_idx]
 
-    # Load pre-trained models
-    print("\nLoading pre-trained models...")
+    print(f"\nTotal Samples: {len(pids)}")
+    print(f"Training/CV Samples: {len(train_idx)}")
+    print(f"Holdout Test Samples: {len(test_idx)}")
+    
+    # Load language model hyperparameters
     with open(LANGUAGE_HPARAMS, "r") as f:
         lang_hp = json.load(f)
+    bert_dim = 384 
+    acoustic_dim = 28 
     
-    bert_dim = len(lang_bert[0][0])
-    
-    # Load and apply scaler
-    with open(ACOUSTIC_SCALER, "rb") as f:
-        scaler = pickle.load(f)
-    train_acoustic_seqs = [scaler.transform(seq) for seq in train_acoustic_seqs]
-    test_acoustic_seqs = [scaler.transform(seq) for seq in test_acoustic_seqs] # Scale test set
-    
-    acoustic_dim = acoustic_seqs[0].shape[1]
-    
-    print(f"✓ Models loaded (lang_hidden={lang_hp['hidden_size']}, acoustic_dim={acoustic_dim})")
-    print(f"Data split: Train (for CV)={len(train_idx)}, Test (holdout)={len(test_idx)}")
-    
-    # Create dataset for CV (Train data only)
+    # Instantiate full training dataset for CV
     train_cv_dataset = MultimodalDataset(
         train_pids, train_lang_bert, train_lang_sent, train_lang_lengths, 
         train_acoustic_seqs, train_acoustic_lengths, train_phq_scores
     )
     
-    # Grid search
-    print("\n" + "="*60)
-    print("HYPERPARAMETER SEARCH (CV on Train Set)")
-    print("="*60)
-    
-    keys, values = zip(*FUSION_GRID.items())
-    combos = [dict(zip(keys, v)) for v in itertools.product(*values)]
-    
-    results = []
-    best_r = -1.0
-    best_config = None
-    
     kf = KFold(n_splits=NUM_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    start_time = time.time()
+    best_r = -float("inf")
+    best_config = None
+    results = []
     
-    for combo_idx, combo in enumerate(combos, 1):
-        print(f"\n[{combo_idx}/{len(combos)}] Testing: {combo}")
+    # --- Hyperparameter Search via Cross-Validation ---
+    
+    # Use itertools.product to generate hyperparameter combinations
+    combos = list(itertools.product(*FUSION_GRID.values()))
+    
+    for combo_idx, combo_values in enumerate(combos):
+        combo = dict(zip(FUSION_GRID.keys(), combo_values))
+        print(f"\n--- Combo {combo_idx+1}/{len(combos)}: {combo}")
         
-        cv_preds_list, cv_labels_list, cv_pids_list = [], [], [] # For saving CV results
+        cv_pids_list, cv_preds_list, cv_labels_list = [], [], []
         
-        # We need indices relative to the train_cv_dataset
-        train_cv_indices = np.arange(len(train_cv_dataset))
-        
-        for fold, (cv_train_idx, cv_val_idx) in enumerate(kf.split(train_cv_indices), 1):
+        for fold, (cv_train_idx, cv_val_idx) in enumerate(kf.split(train_cv_dataset)):
             
-            # Create fresh model architectures
+            # --- Model Initialization for Fold ---
+            
+            # Recreate and load pre-trained models for each fold
             lang_m = ContextualLSTM(bert_dim, lang_hp["hidden_size"], 
-                                   lang_hp["num_layers"], lang_hp["dropout"], lang_hp["fusion"])
+                                    lang_hp["num_layers"], lang_hp["dropout"], 
+                                    lang_hp["fusion"]).to(DEVICE)
             lang_m.load_state_dict(torch.load(LANGUAGE_MODEL, map_location=DEVICE))
+            # Freeze language model
+            for param in lang_m.parameters():
+                param.requires_grad = False
             
-            acoustic_m = AcousticLSTM(acoustic_dim, 128, 1, 0.3)
-            acoustic_m.load_state_dict(torch.load(ACOUSTIC_MODEL, map_location=DEVICE))
+            # The acoustic model's hidden_size is derived from its checkpoint, 
+            # as it's not saved in a separate JSON in this setup.
+            acoustic_ckpt = torch.load(ACOUSTIC_MODEL, map_location=DEVICE)
+            # Example: 'lstm.weight_ih_l0' has shape [4*hidden_size, input_size]
+            hidden_size_ckpt = acoustic_ckpt['lstm.weight_ih_l0'].shape[0] // 4
+            acoustic_m = AcousticLSTM(acoustic_dim, hidden_size_ckpt, num_layers=1, 
+                                      dropout=0.3, bidirectional=False).to(DEVICE)
+            acoustic_m.load_state_dict(acoustic_ckpt)
+            # Freeze acoustic model
+            for param in acoustic_m.parameters():
+                param.requires_grad = False
             
-            model = MultimodalFusion(lang_m, acoustic_m, combo["fusion_hidden"], 
-                                     combo["dropout"]).to(DEVICE)
-            
-            optimizer = torch.optim.Adam(model.parameters(), lr=combo["lr"], 
-                                         weight_decay=WEIGHT_DECAY)
+            # Initialize fusion model
+            # Note: MultimodalFusion calculates lang_dim inside __init__
+            model = MultimodalFusion(lang_m, acoustic_m, combo["fusion_hidden"], combo["dropout"]).to(DEVICE)
+            optimizer = torch.optim.Adam(model.fusion.parameters(), lr=combo["lr"], weight_decay=WEIGHT_DECAY)
             criterion = nn.MSELoss()
             
             # Data loaders
@@ -484,7 +507,7 @@ if __name__ == "__main__":
             cv_val_loader = DataLoader(torch.utils.data.Subset(train_cv_dataset, cv_val_idx),
                                        batch_size=combo["batch_size"], shuffle=False, collate_fn=collate_fn)
             
-            # Train with early stopping
+            # Early stopping
             best_re = float("inf")
             patience = 0
             best_state = model.state_dict()
@@ -492,27 +515,23 @@ if __name__ == "__main__":
             for epoch in range(1, EPOCHS + 1):
                 loss = train_epoch(model, cv_train_loader, optimizer, criterion, DEVICE)
                 r_val, re_val, _, _, _ = evaluate_with_pids(model, cv_val_loader, DEVICE)
-                
                 if np.isnan(loss):
                     break
-                
                 if re_val < best_re:
                     best_re = re_val
                     patience = 0
-                    # Save best model state relative to this fold
+                    # Deep copy the state dict to avoid issues with CUDA device
                     best_state = {k: v.cpu() for k, v in model.state_dict().items()}
                 else:
                     patience += 1
                     if patience >= PATIENCE:
                         break
             
-            # Evaluate best model on validation fold and collect predictions
+            # Evaluate best model on validation fold
             model.load_state_dict(best_state)
             r_test, re_test, pids_val, preds_val, labels_val = evaluate_with_pids(model, cv_val_loader, DEVICE)
+            print(f"  Fold {fold+1}: r={r_test:.4f}, RE={re_test:.4f}")
             
-            print(f"  Fold {fold}: r={r_test:.4f}, RE={re_test:.4f}")
-            
-            # Store predictions for aggregate CV score and saving
             cv_pids_list.extend(pids_val)
             cv_preds_list.extend(preds_val)
             cv_labels_list.extend(labels_val)
@@ -520,41 +539,34 @@ if __name__ == "__main__":
         # Aggregate CV performance
         all_preds = np.array(cv_preds_list)
         all_labels = np.array(cv_labels_list)
-        
         agg_r = pearsonr(all_labels, all_preds)[0] if np.std(all_preds) > 0 else 0.0
         max_label = np.max(all_labels) if np.max(all_labels) > 0 else 1.0
         agg_re = np.mean(np.abs(all_preds - all_labels) / max_label)
-        
         print(f">>> AGGREGATE: r={agg_r:.4f}, RE={agg_re:.4f}")
         
-        combo_result = {
-            **combo, 
-            "agg_r": float(agg_r), 
-            "agg_re": float(agg_re),
-            "cv_pids": cv_pids_list, # New: Store PIDs and results for saving
-            "cv_preds": cv_preds_list,
-            "cv_labels": cv_labels_list
-        }
+        combo_result = {**combo,
+                        "agg_r": float(agg_r),
+                        "agg_re": float(agg_re),
+                        "cv_pids": cv_pids_list,
+                        "cv_preds": cv_preds_list,
+                        "cv_labels": cv_labels_list}
         
         if agg_r > best_r:
             best_r = agg_r
-            best_config = combo_result # Save the entire result including CV data
-        
+            best_config = combo_result
         results.append(combo_result)
     
-    # Save best config and CV results
     print("\n" + "="*60)
     print(f"COMPLETE - Time: {(time.time()-start_time)/60:.1f} min")
     print(f"🏆 BEST CV CONFIG: r={best_r:.4f}")
     
-    # Save a clean version of best config (excluding the massive lists)
+    # Save best config and CV predictions
     best_config_clean = {k: v for k, v in best_config.items() if k not in ("cv_pids", "cv_preds", "cv_labels")}
     print(json.dumps(best_config_clean, indent=2))
     
     with open(os.path.join(FUSION_MODEL_DIR, "best_config.json"), "w") as f:
         json.dump(best_config_clean, f, indent=2)
 
-    # New: Save the CV predictions for analysis
     cv_analysis_df = {
         "PID": best_config["cv_pids"],
         "True_PHQ": best_config["cv_labels"],
@@ -566,18 +578,31 @@ if __name__ == "__main__":
 
     # --- Retrain Final Model on ALL Training Data ---
     print("\nRetraining final model on ALL **Training** data...")
-    lang_final = ContextualLSTM(bert_dim, lang_hp["hidden_size"], lang_hp["num_layers"], 
-                                 lang_hp["dropout"], lang_hp["fusion"])
-    lang_final.load_state_dict(torch.load(LANGUAGE_MODEL, map_location=DEVICE))
     
-    acoustic_final = AcousticLSTM(acoustic_dim, 128, 1, 0.3)
-    acoustic_final.load_state_dict(torch.load(ACOUSTIC_MODEL, map_location=DEVICE))
+    # Acoustic model hidden size needs to be consistent with the saved checkpoint
+    acoustic_ckpt = torch.load(ACOUSTIC_MODEL, map_location=DEVICE)
+    acoustic_h_size = acoustic_ckpt['lstm.weight_ih_l0'].shape[0] // 4
+    
+    lang_final = ContextualLSTM(bert_dim, lang_hp["hidden_size"], lang_hp["num_layers"], 
+                                lang_hp["dropout"], lang_hp["fusion"]).to(DEVICE)
+    lang_final.load_state_dict(torch.load(LANGUAGE_MODEL, map_location=DEVICE))
+    # Freeze language model to preserve learned representations
+    for param in lang_final.parameters():
+        param.requires_grad = False
+    
+    acoustic_final = AcousticLSTM(acoustic_dim, acoustic_h_size, num_layers=1, 
+                                  dropout=0.3, bidirectional=False).to(DEVICE)
+    acoustic_final.load_state_dict(acoustic_ckpt)
+    # Freeze acoustic model to preserve learned representations
+    for param in acoustic_final.parameters():
+        param.requires_grad = False
     
     final_model = MultimodalFusion(lang_final, acoustic_final, 
                                    best_config_clean["fusion_hidden"], 
                                    best_config_clean["dropout"]).to(DEVICE)
     
-    optimizer = torch.optim.Adam(final_model.parameters(), lr=best_config_clean["lr"], 
+    # Only train fusion network, not pre-trained models
+    optimizer = torch.optim.Adam(final_model.fusion.parameters(), lr=best_config_clean["lr"], 
                                  weight_decay=WEIGHT_DECAY)
     criterion = nn.MSELoss()
     
@@ -590,13 +615,14 @@ if __name__ == "__main__":
     
     for epoch in range(1, EPOCHS + 1):
         loss = train_epoch(final_model, loader, optimizer, criterion, DEVICE)
+        
+        # Saving state based on lowest training loss across epochs
         if loss < best_loss:
             best_loss = loss
-            # Saving state based on lowest training loss across epochs (simple approach)
             best_state_final = {k: v.cpu() for k, v in final_model.state_dict().items()}
         
         if epoch % 10 == 0:
-            print(f"  Epoch {epoch}: loss={loss:.4f}")
+            print(f"  Epoch {epoch}: loss={loss:.4f}")
     
     final_model.load_state_dict(best_state_final)
     torch.save(final_model.state_dict(), os.path.join(FUSION_MODEL_DIR, "fusion_best.pt"))
@@ -619,8 +645,8 @@ if __name__ == "__main__":
     r_final, re_final, pids_final, preds_final, labels_final = evaluate_with_pids(final_model, test_loader, DEVICE)
 
     print(f"**Final Test Set Performance (N={len(test_idx)}):**")
-    print(f"  Pearson's r: **{r_final:.4f}**")
-    print(f"  Relative Error (RE): **{re_final:.4f}**")
+    print(f"  Pearson's r: **{r_final:.4f}**")
+    print(f"  Relative Error (RE): **{re_final:.4f}**")
     
     # Save test set predictions for reporting
     test_analysis_df = {
